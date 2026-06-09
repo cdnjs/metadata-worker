@@ -7,9 +7,10 @@
 // Goal: confirm the new KV-backed worker returns the same data as the
 // existing speedcdnjs origin, without affecting the user response.
 //
-// Each unique path is compared at most once:
-//   - matches go into the Cache API with a 24h TTL
-//   - mismatches go into D1 (env.SHADOW_DB) and stay there until manually cleared
+// Each unique path is compared at most once per 24h per colo:
+//   - matches get a Cache API marker (24h TTL) so we don't re-fetch.
+//   - mismatches go into D1 (env.SHADOW_DB) until manually cleared, AND get
+//     the same 24h Cache API marker so repeat hits don't keep reading D1.
 //
 // All work runs in ctx.waitUntil so user latency is unaffected.
 
@@ -243,8 +244,12 @@ export async function shadowCompare(newResponse, request, env, sentry) {
   try {
     // Skip if we've already verified this path recently.
     if (await isAlreadyChecked(pathname)) return;
-    // Skip if it's a known-bad path.
-    if (await isKnownMismatch(db, pathname)) return;
+    // Skip if it's a known-bad path. Refresh the Cache API marker so future
+    // hits in this colo bail out at isAlreadyChecked without re-reading D1.
+    if (await isKnownMismatch(db, pathname)) {
+      await markChecked(pathname);
+      return;
+    }
 
     // Fetch the same path from the old origin.
     const oldUrl = `${origin}${pathname}${url.search || ""}`;
@@ -269,7 +274,10 @@ export async function shadowCompare(newResponse, request, env, sentry) {
       return;
     }
 
+    // Record the mismatch in D1, then drop a Cache API marker so further
+    // hits in this colo skip the D1 read for the marker's TTL.
     await recordMismatch(db, pathname, endpointType, result);
+    await markChecked(pathname);
   } catch (e) {
     if (sentry) sentry.captureException(e);
   }
