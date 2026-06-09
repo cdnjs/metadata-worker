@@ -9,6 +9,15 @@ export default {
       request,
       context: ctx,
       environment: env.ENV,
+      // sentry10.cfdata.org is behind Cloudflare Access. Authenticate the
+      // worker→Sentry POST with a service token, the same pattern used by
+      // worker-files. Both values come from `wrangler secret put`.
+      transportOptions: {
+        headers: {
+          "CF-Access-Client-ID": env.SENTRY_CLIENT_ID,
+          "CF-Access-Client-Secret": env.SENTRY_CLIENT_SECRET,
+        },
+      },
     });
     return handleRequest(request, env, ctx, sentry);
   },
