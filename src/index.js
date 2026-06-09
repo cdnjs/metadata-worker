@@ -1,4 +1,5 @@
 import { ALLOWED_EXTENSIONS } from "./constants.js";
+import { shadowCompare } from "./shadow.js";
 import Toucan from "toucan-js";
 
 addEventListener("fetch", (event) => {
@@ -34,6 +35,9 @@ async function handleRequest(event, sentry) {
   function cache_resp(resp, cache, cache_key, max_age) {
     resp.headers.append("Cache-Control", `max-age=${max_age}`);
     event.waitUntil(cache.put(cache_key, resp.clone()));
+    // Shadow-compare in background. Runs on cache misses only (this function
+    // is only reached when cache.match() returned undefined upstream).
+    event.waitUntil(shadowCompare(resp.clone(), event.request, sentry));
     return resp;
   }
 
