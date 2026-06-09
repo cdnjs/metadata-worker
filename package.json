@@ -1,6 +1,6 @@
 {
   "main": "./src/index.js",
   "dependencies": {
-    "toucan-js": "^2.1.0"
+    "toucan-js": "^4.1.1"
   }
 }

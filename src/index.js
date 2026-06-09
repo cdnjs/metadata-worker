@@ -1,17 +1,20 @@
 import { ALLOWED_EXTENSIONS } from "./constants.js";
 import { shadowCompare } from "./shadow.js";
-import Toucan from "toucan-js";
+import { Toucan } from "toucan-js";
 
-addEventListener("fetch", (event) => {
-  const sentry = new Toucan({
-    dsn: SENTRY_DSN,
-    event,
-    environment: ENV,
-  });
-  event.respondWith(handleRequest(event, sentry));
-});
+export default {
+  async fetch(request, env, ctx) {
+    const sentry = new Toucan({
+      dsn: env.SENTRY_DSN,
+      request,
+      context: ctx,
+      environment: env.ENV,
+    });
+    return handleRequest(request, env, ctx, sentry);
+  },
+};
 
-async function handleRequest(event, sentry) {
+async function handleRequest(request, env, ctx, sentry) {
   function respond(msg, status) {
     return new Response(msg, { status });
   }
@@ -34,26 +37,25 @@ async function handleRequest(event, sentry) {
 
   function cache_resp(resp, cache, cache_key, max_age) {
     resp.headers.append("Cache-Control", `max-age=${max_age}`);
-    event.waitUntil(cache.put(cache_key, resp.clone()));
+    ctx.waitUntil(cache.put(cache_key, resp.clone()));
     // Shadow-compare in background. Runs on cache misses only (this function
     // is only reached when cache.match() returned undefined upstream).
-    event.waitUntil(shadowCompare(resp.clone(), event.request, sentry));
+    ctx.waitUntil(shadowCompare(resp.clone(), request, env, sentry));
     return resp;
   }
 
   // Gets all keys in a KV namespace.
   async function* get_all_keys(namespace, options) {
+    let cursor;
+    let list_complete;
     do {
-      var { keys, list_complete, cursor } = await namespace.list({
-        ...options,
-        cursor,
-      });
-      for (const key of keys) yield key;
+      const result = await namespace.list({ ...options, cursor });
+      ({ list_complete, cursor } = result);
+      for (const key of result.keys) yield key;
     } while (list_complete === false);
   }
 
   try {
-    const { request } = event;
     const url = new URL(request.url);
     const pathname = decodeURI(url.pathname);
 
@@ -78,7 +80,7 @@ async function handleRequest(event, sentry) {
       // Endpoint: `/packages`.
       // Return list of package names.
       let package_names = [];
-      for await (const { name } of get_all_keys(CDNJS_PACKAGES)) {
+      for await (const { name } of get_all_keys(env.CDNJS_PACKAGES)) {
         package_names.push(name);
       }
 
@@ -100,7 +102,7 @@ async function handleRequest(event, sentry) {
       // Endpoint: `/packages/<package name>`.
       // Fetch package metadata from KV.
       const { package_name } = packages_endpoint.groups;
-      const package_json = await CDNJS_PACKAGES.get(package_name);
+      const package_json = await env.CDNJS_PACKAGES.get(package_name);
       if (package_json === null) {
         // Cache 404 package for an hour.
         // New packages are not added often.
@@ -121,7 +123,7 @@ async function handleRequest(event, sentry) {
       // Fetch SRIs for a package.
       const { package_name, version_name } = pkg_sris_endpoint.groups;
       let sris = {};
-      for await (const { name, metadata } of get_all_keys(CDNJS_SRIS, {
+      for await (const { name, metadata } of get_all_keys(env.CDNJS_SRIS, {
         prefix: `${package_name}/${
           version_name === undefined ? "" : version_name
         }`,
@@ -142,7 +144,7 @@ async function handleRequest(event, sentry) {
       // Endpoint: `/packages/<package name>/all`.
       // Fetch aggregated metadata for a package.
       const { package_name } = aggregated_metadata_endpoint.groups;
-      const aggregated_gzip = await CDNJS_AGGREGATED_METADATA.get(
+      const aggregated_gzip = await env.CDNJS_AGGREGATED_METADATA.get(
         package_name,
         "arrayBuffer"
       );
@@ -170,7 +172,7 @@ async function handleRequest(event, sentry) {
       const version_prefix = `${package_name}/`;
 
       let version_names = [];
-      for await (const { name } of get_all_keys(CDNJS_VERSIONS, {
+      for await (const { name } of get_all_keys(env.CDNJS_VERSIONS, {
         prefix: version_prefix,
       })) {
         version_names.push(name.substring(version_prefix.length));
@@ -194,7 +196,7 @@ async function handleRequest(event, sentry) {
       // Endpoint: `/packages/<package name>/versions/<version name>`.
       const { package_name, version_name } = version_endpoint.groups;
       const version_key = `${package_name}/${version_name}`;
-      const version_json = await CDNJS_VERSIONS.get(version_key);
+      const version_json = await env.CDNJS_VERSIONS.get(version_key);
       if (version_json === null) {
         // Cache 404 version for an hour since the
         // autoupdater runs about once per hour.
@@ -215,6 +217,6 @@ async function handleRequest(event, sentry) {
     return forbid();
   } catch (e) {
     sentry.captureException(e);
-    return ENV === "production" ? err() : err(e.stack);
+    return env.ENV === "production" ? err() : err(e.stack);
   }
 }

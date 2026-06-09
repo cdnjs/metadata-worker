@@ -1,6 +1,6 @@
 // Shadow comparison against the legacy speedcdnjs origin.
 //
-// Origin is per-environment via the SHADOW_ORIGIN TOML var
+// Origin is per-environment via the SHADOW_ORIGIN var on env
 // (e.g. https://metadata.speedcdnjs.com for production,
 //  https://metadata-staging.speedcdnjs.com for staging).
 //
@@ -9,9 +9,9 @@
 //
 // Each unique path is compared at most once:
 //   - matches go into the Cache API with a 24h TTL
-//   - mismatches go into D1 (SHADOW_DB) and stay there until manually cleared
+//   - mismatches go into D1 (env.SHADOW_DB) and stay there until manually cleared
 //
-// All work runs in event.waitUntil so user latency is unaffected.
+// All work runs in ctx.waitUntil so user latency is unaffected.
 
 const CHECKED_CACHE_BASE = "https://shadow-checked.internal";
 const CHECKED_TTL_SECONDS = 24 * 60 * 60; // 24h
@@ -32,13 +32,11 @@ function classify(pathname) {
   return "other";
 }
 
-function sampleRate() {
+function sampleRate(env) {
   // SHADOW_SAMPLE_RATE is provided as a string var. Default to 0 (off) if missing
   // or malformed so a misconfigured deploy can't accidentally double traffic.
   try {
-    const v = parseFloat(
-      typeof SHADOW_SAMPLE_RATE === "undefined" ? "0" : SHADOW_SAMPLE_RATE
-    );
+    const v = parseFloat(env.SHADOW_SAMPLE_RATE ?? "0");
     if (!Number.isFinite(v) || v <= 0) return 0;
     return v > 1 ? 1 : v;
   } catch {
@@ -46,19 +44,18 @@ function sampleRate() {
   }
 }
 
-function shadowEnabled() {
+function shadowEnabled(env) {
   // D1 binding must exist, otherwise we silently no-op.
-  return typeof SHADOW_DB !== "undefined" && SHADOW_DB !== null;
+  return env && env.SHADOW_DB != null;
 }
 
 // Return the origin to shadow-compare against, or null if not configured.
-// Configured per environment via the SHADOW_ORIGIN TOML var.
-function shadowOrigin() {
-  if (typeof SHADOW_ORIGIN === "undefined" || !SHADOW_ORIGIN) return null;
+// Configured per environment via the SHADOW_ORIGIN var.
+function shadowOrigin(env) {
+  const origin = env && env.SHADOW_ORIGIN;
+  if (!origin) return null;
   // Strip a trailing slash so we can concatenate the pathname directly.
-  return SHADOW_ORIGIN.endsWith("/")
-    ? SHADOW_ORIGIN.slice(0, -1)
-    : SHADOW_ORIGIN;
+  return origin.endsWith("/") ? origin.slice(0, -1) : origin;
 }
 
 // Compare two responses. Returns one of:
@@ -183,11 +180,10 @@ async function isAlreadyChecked(pathname) {
   return hit !== undefined;
 }
 
-async function isKnownMismatch(pathname) {
+async function isKnownMismatch(db, pathname) {
   try {
-    const row = await SHADOW_DB.prepare(
-      "SELECT 1 FROM shadow_mismatches WHERE path = ? LIMIT 1"
-    )
+    const row = await db
+      .prepare("SELECT 1 FROM shadow_mismatches WHERE path = ? LIMIT 1")
       .bind(pathname)
       .first();
     return row !== null;
@@ -197,14 +193,15 @@ async function isKnownMismatch(pathname) {
   }
 }
 
-async function recordMismatch(pathname, endpointType, result) {
+async function recordMismatch(db, pathname, endpointType, result) {
   const now = Math.floor(Date.now() / 1000);
   // INSERT OR IGNORE so concurrent requests for the same path don't error.
-  await SHADOW_DB.prepare(
-    `INSERT OR IGNORE INTO shadow_mismatches
-       (path, endpoint_type, status_new, status_old, diff_kind, first_seen)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  )
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO shadow_mismatches
+         (path, endpoint_type, status_new, status_old, diff_kind, first_seen)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
     .bind(
       pathname,
       endpointType,
@@ -216,21 +213,23 @@ async function recordMismatch(pathname, endpointType, result) {
     .run();
 }
 
-// Main entry. Call from within event.waitUntil.
+// Main entry. Call from within ctx.waitUntil.
 //
 //   newResponse: the Response we are about to return to the user. Caller MUST
 //   pass a clone — we will consume the body.
 //
 //   request: the original Request (for method + headers).
 //
+//   env: the worker env, providing SHADOW_DB / SHADOW_ORIGIN / SHADOW_SAMPLE_RATE.
+//
 //   sentry: optional Toucan instance for error capture.
-export async function shadowCompare(newResponse, request, sentry) {
-  if (!shadowEnabled()) return;
+export async function shadowCompare(newResponse, request, env, sentry) {
+  if (!shadowEnabled(env)) return;
 
-  const origin = shadowOrigin();
+  const origin = shadowOrigin(env);
   if (!origin) return;
 
-  const rate = sampleRate();
+  const rate = sampleRate(env);
   if (rate <= 0) return;
   if (Math.random() >= rate) return;
 
@@ -239,11 +238,13 @@ export async function shadowCompare(newResponse, request, sentry) {
   const endpointType = classify(pathname);
   if (endpointType === "other") return;
 
+  const db = env.SHADOW_DB;
+
   try {
     // Skip if we've already verified this path recently.
     if (await isAlreadyChecked(pathname)) return;
     // Skip if it's a known-bad path.
-    if (await isKnownMismatch(pathname)) return;
+    if (await isKnownMismatch(db, pathname)) return;
 
     // Fetch the same path from the old origin.
     const oldUrl = `${origin}${pathname}${url.search || ""}`;
@@ -268,7 +269,7 @@ export async function shadowCompare(newResponse, request, sentry) {
       return;
     }
 
-    await recordMismatch(pathname, endpointType, result);
+    await recordMismatch(db, pathname, endpointType, result);
   } catch (e) {
     if (sentry) sentry.captureException(e);
   }
