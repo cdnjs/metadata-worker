@@ -1,3 +1,4 @@
 node_modules
 dist/worker.js
 worker/script.js
+worker-api-cdnjs-account-wrangler.toml
