@@ -1,21 +1,29 @@
 #!/usr/bin/env bash
 # Provision a D1 database for shadow comparison and apply the schema.
 #
+# Transitional script for the speedcdnjs → KV migration. See
+# scripts/migration/README.md for context and the post-migration cleanup
+# checklist.
+#
 # Run in two phases, because wrangler can't apply the schema --remote until
 # the database_id is wired into the config:
 #
 #   Phase 1 — create:
-#     ./scripts/create-d1.sh staging create
+#     ./scripts/migration/create-d1.sh staging create
 #     # Copy the printed database_id into worker-api-cdnjs-account-wrangler.toml
 #     # under [[env.staging.d1_databases]].
 #
 #   Phase 2 — migrate (after pasting the id):
-#     ./scripts/create-d1.sh staging migrate
+#     ./scripts/migration/create-d1.sh staging migrate
 #
 # Same for production. Or run without an action to do the legacy
 # create-then-migrate flow (only works if database_id is already filled in).
 
 set -euo pipefail
+
+# Always run from the repo root so the relative WRANGLER_CONFIG / SCHEMA
+# paths below resolve regardless of where the script is invoked from.
+cd "$(dirname "$0")/../.."
 
 ENV="${1:-}"
 ACTION="${2:-all}"
