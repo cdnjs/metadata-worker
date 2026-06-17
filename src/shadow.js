@@ -277,7 +277,11 @@ export async function shadowCompare(newResponse, request, env, sentry) {
   if (Math.random() >= rate) return;
 
   const url = new URL(request.url);
-  const pathname = decodeURI(url.pathname);
+  // Keep pathname URL-encoded — it's used to reconstruct the upstream URL
+  // (`oldUrl` below) and as a key for Cache API / D1 markers, both of which
+  // want the raw routing-form. `decodeURI` was historically a no-op for the
+  // reserved chars (`@`, `&`, etc.) we actually care about anyway.
+  const pathname = url.pathname;
   const endpointType = classify(pathname);
   if (endpointType === "other") return;
 

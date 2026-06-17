@@ -66,7 +66,11 @@ async function handleRequest(request, env, ctx, sentry) {
 
   try {
     const url = new URL(request.url);
-    const pathname = decodeURI(url.pathname);
+    // Keep pathname URL-encoded for routing; decode each captured segment
+    // individually below before using it as a KV key. `decodeURI` does NOT
+    // decode reserved chars like `@` (`%40`), which broke version lookups
+    // for names such as `scatterjs-core@2.7.18`.
+    const pathname = url.pathname;
 
     if (pathname === "/favicon.ico") {
       return not_found("not found");
@@ -110,7 +114,7 @@ async function handleRequest(request, env, ctx, sentry) {
     if (packages_endpoint !== null) {
       // Endpoint: `/packages/<package name>`.
       // Fetch package metadata from KV.
-      const { package_name } = packages_endpoint.groups;
+      const package_name = decodeURIComponent(packages_endpoint.groups.package_name);
       const package_json = await env.CDNJS_PACKAGES.get(package_name);
       if (package_json === null) {
         // Cache 404 package for an hour.
@@ -130,7 +134,11 @@ async function handleRequest(request, env, ctx, sentry) {
     if (pkg_sris_endpoint !== null) {
       // Endpoints: `/packages/<package name>/sris`, `/packages/<package name>/sris/<version name>`
       // Fetch SRIs for a package.
-      const { package_name, version_name } = pkg_sris_endpoint.groups;
+      const package_name = decodeURIComponent(pkg_sris_endpoint.groups.package_name);
+      const version_name =
+        pkg_sris_endpoint.groups.version_name === undefined
+          ? undefined
+          : decodeURIComponent(pkg_sris_endpoint.groups.version_name);
       let sris = {};
       for await (const { name, metadata } of get_all_keys(env.CDNJS_SRIS, {
         prefix: `${package_name}/${
@@ -152,7 +160,9 @@ async function handleRequest(request, env, ctx, sentry) {
     if (aggregated_metadata_endpoint !== null) {
       // Endpoint: `/packages/<package name>/all`.
       // Fetch aggregated metadata for a package.
-      const { package_name } = aggregated_metadata_endpoint.groups;
+      const package_name = decodeURIComponent(
+        aggregated_metadata_endpoint.groups.package_name
+      );
       const aggregated_gzip = await env.CDNJS_AGGREGATED_METADATA.get(
         package_name,
         "arrayBuffer"
@@ -177,7 +187,7 @@ async function handleRequest(request, env, ctx, sentry) {
     if (versions_endpoint !== null) {
       // Endpoint: `/packages/<package name>/versions`.
       // Fetch all versions for a package.
-      const { package_name } = versions_endpoint.groups;
+      const package_name = decodeURIComponent(versions_endpoint.groups.package_name);
       const version_prefix = `${package_name}/`;
 
       let version_names = [];
@@ -203,7 +213,8 @@ async function handleRequest(request, env, ctx, sentry) {
 
     if (version_endpoint !== null) {
       // Endpoint: `/packages/<package name>/versions/<version name>`.
-      const { package_name, version_name } = version_endpoint.groups;
+      const package_name = decodeURIComponent(version_endpoint.groups.package_name);
+      const version_name = decodeURIComponent(version_endpoint.groups.version_name);
       const version_key = `${package_name}/${version_name}`;
       const version_json = await env.CDNJS_VERSIONS.get(version_key);
       if (version_json === null) {
