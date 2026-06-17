@@ -106,13 +106,24 @@ async function compare(newResp, oldResp, endpointType) {
       : { match: false, statusNew, statusOld, diffKind: "body" };
   }
 
-  if (
+  // Above the size threshold, try a cheap byte-compare first to avoid the
+  // unbounded JSON.parse + deep-equal CPU cost on huge bodies (a single react
+  // /sris response is ~4.7 MB / 26k keys). Byte-equal is safe because both
+  // sides iterate KV in lexicographic order, so key ordering is stable.
+  //
+  // For non-SRI endpoints, byte inequality is a real mismatch.
+  // For SRI endpoints, we still need to parse on mismatch so we can apply the
+  // "new ⊇ old" tolerance — both pipelines are best-effort and the new side
+  // may legitimately have strictly more keys.
+  const oversized =
     newBuf.byteLength > BYTE_COMPARE_THRESHOLD ||
-    oldBuf.byteLength > BYTE_COMPARE_THRESHOLD
-  ) {
-    return bytesEqual(newBuf, oldBuf)
-      ? { match: true, statusNew, statusOld }
-      : { match: false, statusNew, statusOld, diffKind: "body" };
+    oldBuf.byteLength > BYTE_COMPARE_THRESHOLD;
+
+  if (oversized && bytesEqual(newBuf, oldBuf)) {
+    return { match: true, statusNew, statusOld };
+  }
+  if (oversized && endpointType !== "sris") {
+    return { match: false, statusNew, statusOld, diffKind: "body" };
   }
 
   const decoder = new TextDecoder();
@@ -129,9 +140,40 @@ async function compare(newResp, oldResp, endpointType) {
       : { match: false, statusNew, statusOld, diffKind: "body" };
   }
 
-  return deepEqual(newJson, oldJson)
-    ? { match: true, statusNew, statusOld }
-    : { match: false, statusNew, statusOld, diffKind: "body" };
+  if (deepEqual(newJson, oldJson)) {
+    return { match: true, statusNew, statusOld };
+  }
+
+  // For SRI maps, the legacy and KV-backed pipelines are both best-effort:
+  // each silently skips files it can't hash. Treat "new is a superset of old"
+  // (every key in old exists in new with the same value) as a match — we have
+  // strictly more coverage, not drift. Extras on the old side are still a
+  // mismatch (we'd be losing coverage).
+  if (endpointType === "sris" && isSuperset(newJson, oldJson)) {
+    return { match: true, statusNew, statusOld };
+  }
+
+  return { match: false, statusNew, statusOld, diffKind: "body" };
+}
+
+// True if `sup` contains every key in `sub` with an equal value.
+// Both must be plain objects. Extra keys in `sup` are allowed.
+function isSuperset(sup, sub) {
+  if (
+    sup === null ||
+    sub === null ||
+    typeof sup !== "object" ||
+    typeof sub !== "object" ||
+    Array.isArray(sup) ||
+    Array.isArray(sub)
+  ) {
+    return false;
+  }
+  for (const k of Object.keys(sub)) {
+    if (!Object.prototype.hasOwnProperty.call(sup, k)) return false;
+    if (!deepEqual(sup[k], sub[k])) return false;
+  }
+  return true;
 }
 
 function bytesEqual(a, b) {
