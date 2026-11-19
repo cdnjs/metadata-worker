@@ -216,8 +216,11 @@ async function handleRequest(request, env, ctx, sentry) {
       const package_name = decodeURIComponent(version_endpoint.groups.package_name);
       const version_name = decodeURIComponent(version_endpoint.groups.version_name);
       const version_key = `${package_name}/${version_name}`;
-      const version_json = await env.CDNJS_VERSIONS.get(version_key);
-      if (version_json === null) {
+      const version_value = await env.CDNJS_VERSIONS.get(
+        version_key,
+        "arrayBuffer"
+      );
+      if (version_value === null) {
         // Cache 404 version for an hour since the
         // autoupdater runs about once per hour.
         return cache_resp(
@@ -228,9 +231,23 @@ async function handleRequest(request, env, ctx, sentry) {
         );
       }
 
+      // The bot stores a file list over 20 MiB of JSON gzipped, because a KV
+      // value holds at most 25 MiB. Send those bytes as they are with
+      // Content-Encoding: gzip, so HTTP clients inflate them. Reading the
+      // value as text would corrupt it.
+      const bytes = new Uint8Array(version_value);
+      const resp =
+        bytes[0] === 0x1f && bytes[1] === 0x8b
+          ? new Response(version_value, {
+              status: 200,
+              headers: { "Content-Encoding": "gzip" },
+              encodeBody: "manual",
+            })
+          : ok(new TextDecoder().decode(bytes));
+
       // Each version is immutable once in KV
       // so cache it for a year.
-      return cache_resp(ok(version_json), cache, cache_key, "31536000");
+      return cache_resp(resp, cache, cache_key, "31536000");
     }
 
     // Unknown request.

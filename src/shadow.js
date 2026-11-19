@@ -97,7 +97,16 @@ async function compare(newResp, oldResp, endpointType) {
   //     both sides iterate KV in lexicographic order, so key ordering is stable.
   //   - Smaller JSON: parse and deep-equal so we tolerate key-order or
   //     whitespace differences if the sources ever diverge in formatting.
-  const newBuf = await newResp.arrayBuffer();
+  // A gzipped version list (over 20 MiB of JSON) is sent with Content-Encoding:
+  // gzip and encodeBody "manual", so this clone holds the gzip bytes while the
+  // origin fetch below returns decoded JSON. Inflate it before comparing.
+  let newBuf = await newResp.arrayBuffer();
+  const head = new Uint8Array(newBuf, 0, Math.min(2, newBuf.byteLength));
+  if (endpointType === "version" && head[0] === 0x1f && head[1] === 0x8b) {
+    newBuf = await new Response(
+      new Blob([newBuf]).stream().pipeThrough(new DecompressionStream("gzip"))
+    ).arrayBuffer();
+  }
   const oldBuf = await oldResp.arrayBuffer();
 
   if (endpointType === "aggregated") {
