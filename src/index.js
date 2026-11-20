@@ -1,9 +1,19 @@
+import { WorkerEntrypoint } from "cloudflare:workers";
 import { ALLOWED_EXTENSIONS } from "./constants.js";
-import { shadowCompare } from "./shadow.js";
 import { Toucan } from "toucan-js";
 
-export default {
-  async fetch(request, env, ctx) {
+// Workers Cache sits in front of fetch() (`[cache]` in the wrangler config),
+// keyed on path and query string. Responses set their TTL with Cache-Control.
+export default class extends WorkerEntrypoint {
+  // Purges this entrypoint's Workers Cache. A zone purge does not reach it.
+  // RPC methods bypass the cache, and there is no HTTP route for this.
+  async purge(arg) {
+    return await this.ctx.cache.purge(arg);
+  }
+
+  async fetch(request) {
+    const env = this.env;
+    const ctx = this.ctx;
     const sentry = new Toucan({
       dsn: env.SENTRY_DSN,
       request,
@@ -19,11 +29,11 @@ export default {
         },
       },
     });
-    return handleRequest(request, env, ctx, sentry);
-  },
-};
+    return handleRequest(request, env, sentry);
+  }
+}
 
-async function handleRequest(request, env, ctx, sentry) {
+async function handleRequest(request, env, sentry) {
   function respond(msg, status) {
     return new Response(msg, { status });
   }
@@ -44,45 +54,24 @@ async function handleRequest(request, env, ctx, sentry) {
     return respond(msg, 500);
   }
 
-  // `manual`: `resp` has encodeBody "manual", so its body is already encoded.
-  function cache_resp(resp, cache, cache_key, max_age, manual = false) {
+  function cache_resp(resp, max_age) {
     resp.headers.append("Cache-Control", `max-age=${max_age}`);
-    // clone() drops encodeBody "manual", and cache.put would then encode the
-    // body a second time, so cache hits sent two gzip layers.
-    const copy = resp.clone();
-    ctx.waitUntil(
-      cache.put(
-        cache_key,
-        manual
-          ? new Response(copy.body, {
-              status: copy.status,
-              headers: copy.headers,
-              encodeBody: "manual",
-            })
-          : copy
-      )
-    );
-    // Shadow-compare in background. Runs on cache misses only (this function
-    // is only reached when cache.match() returned undefined upstream).
-    ctx.waitUntil(shadowCompare(resp.clone(), request, env, sentry));
     return resp;
   }
 
   // Responds with a KV value read as an ArrayBuffer. A gzipped value is sent
   // as it is with Content-Encoding: gzip and encodeBody "manual", so HTTP
   // clients inflate it once. Without "manual" the runtime gzips it again.
-  // Pass `gzipped` on to cache_resp.
   function kv_bytes_resp(value) {
     const bytes = new Uint8Array(value);
-    const gzipped = bytes[0] === 0x1f && bytes[1] === 0x8b;
-    const resp = gzipped
-      ? new Response(value, {
-          status: 200,
-          headers: { "Content-Encoding": "gzip" },
-          encodeBody: "manual",
-        })
-      : ok(new TextDecoder().decode(bytes));
-    return { resp, gzipped };
+    if (bytes[0] === 0x1f && bytes[1] === 0x8b) {
+      return new Response(value, {
+        status: 200,
+        headers: { "Content-Encoding": "gzip" },
+        encodeBody: "manual",
+      });
+    }
+    return ok(new TextDecoder().decode(bytes));
   }
 
   // Gets all keys in a KV namespace.
@@ -109,16 +98,8 @@ async function handleRequest(request, env, ctx, sentry) {
     }
 
     if (pathname === "/extensions") {
-      return ok(JSON.stringify(ALLOWED_EXTENSIONS));
-    }
-
-    const cache = caches.default;
-    const cache_key = new Request(url.toString(), request);
-
-    // Check cache for request.
-    let response = await cache.match(cache_key);
-    if (response !== undefined) {
-      return response;
+      // Changes only with a deploy.
+      return cache_resp(ok(JSON.stringify(ALLOWED_EXTENSIONS)), "3600");
     }
 
     if (pathname === "/packages") {
@@ -131,12 +112,7 @@ async function handleRequest(request, env, ctx, sentry) {
 
       // Cache response for an hour.
       // New packages are not added often.
-      return cache_resp(
-        ok(JSON.stringify(package_names)),
-        cache,
-        cache_key,
-        "3600"
-      );
+      return cache_resp(ok(JSON.stringify(package_names)), "3600");
     }
 
     const packages_endpoint = new RegExp(
@@ -151,12 +127,12 @@ async function handleRequest(request, env, ctx, sentry) {
       if (package_json === null) {
         // Cache 404 package for an hour.
         // New packages are not added often.
-        return cache_resp(not_found(), cache, cache_key, "3600");
+        return cache_resp(not_found(), "3600");
       }
 
       // Cache package metadata for an hour since the
       // autoupdater runs about once per hour.
-      return cache_resp(ok(package_json), cache, cache_key, "3600");
+      return cache_resp(ok(package_json), "3600");
     }
 
     const pkg_sris_endpoint = new RegExp(
@@ -182,7 +158,7 @@ async function handleRequest(request, env, ctx, sentry) {
 
       // Cache SRIs for an hour since the
       // autoupdater runs about once per hour.
-      return cache_resp(ok(JSON.stringify(sris)), cache, cache_key, "3600");
+      return cache_resp(ok(JSON.stringify(sris)), "3600");
     }
 
     const aggregated_metadata_endpoint = new RegExp(
@@ -202,15 +178,15 @@ async function handleRequest(request, env, ctx, sentry) {
       if (aggregated_value === null) {
         // Cache 404 package for an hour.
         // New packages are not added often.
-        return cache_resp(not_found(), cache, cache_key, "3600");
+        return cache_resp(not_found(), "3600");
       }
 
       // The bot stores aggregated metadata gzipped.
-      const { resp, gzipped } = kv_bytes_resp(aggregated_value);
+      const resp = kv_bytes_resp(aggregated_value);
 
       // Cache package metadata for a couple minutes.
       // The API will use this metadata to update itself often.
-      return cache_resp(resp, cache, cache_key, "300", gzipped);
+      return cache_resp(resp, "300");
     }
 
     const versions_endpoint = new RegExp(
@@ -232,12 +208,7 @@ async function handleRequest(request, env, ctx, sentry) {
 
       // Cache versions for an hour since the
       // autoupdater runs about once per hour.
-      return cache_resp(
-        ok(JSON.stringify(version_names)),
-        cache,
-        cache_key,
-        "3600"
-      );
+      return cache_resp(ok(JSON.stringify(version_names)), "3600");
     }
 
     const version_endpoint = new RegExp(
@@ -258,19 +229,17 @@ async function handleRequest(request, env, ctx, sentry) {
         // autoupdater runs about once per hour.
         return cache_resp(
           not_found(`version not found: ${version_key}`),
-          cache,
-          cache_key,
           "3600"
         );
       }
 
       // The bot stores a file list over 20 MiB of JSON gzipped, because a KV
       // value holds at most 25 MiB. Reading the value as text would corrupt it.
-      const { resp, gzipped } = kv_bytes_resp(version_value);
+      const resp = kv_bytes_resp(version_value);
 
       // Each version is immutable once in KV
       // so cache it for a year.
-      return cache_resp(resp, cache, cache_key, "31536000", gzipped);
+      return cache_resp(resp, "31536000");
     }
 
     // Unknown request.
