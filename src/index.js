@@ -68,6 +68,23 @@ async function handleRequest(request, env, ctx, sentry) {
     return resp;
   }
 
+  // Responds with a KV value read as an ArrayBuffer. A gzipped value is sent
+  // as it is with Content-Encoding: gzip and encodeBody "manual", so HTTP
+  // clients inflate it once. Without "manual" the runtime gzips it again.
+  // Pass `gzipped` on to cache_resp.
+  function kv_bytes_resp(value) {
+    const bytes = new Uint8Array(value);
+    const gzipped = bytes[0] === 0x1f && bytes[1] === 0x8b;
+    const resp = gzipped
+      ? new Response(value, {
+          status: 200,
+          headers: { "Content-Encoding": "gzip" },
+          encodeBody: "manual",
+        })
+      : ok(new TextDecoder().decode(bytes));
+    return { resp, gzipped };
+  }
+
   // Gets all keys in a KV namespace.
   async function* get_all_keys(namespace, options) {
     let cursor;
@@ -178,21 +195,22 @@ async function handleRequest(request, env, ctx, sentry) {
       const package_name = decodeURIComponent(
         aggregated_metadata_endpoint.groups.package_name
       );
-      const aggregated_gzip = await env.CDNJS_AGGREGATED_METADATA.get(
+      const aggregated_value = await env.CDNJS_AGGREGATED_METADATA.get(
         package_name,
         "arrayBuffer"
       );
-      if (aggregated_gzip === null) {
+      if (aggregated_value === null) {
         // Cache 404 package for an hour.
         // New packages are not added often.
         return cache_resp(not_found(), cache, cache_key, "3600");
       }
 
+      // The bot stores aggregated metadata gzipped.
+      const { resp, gzipped } = kv_bytes_resp(aggregated_value);
+
       // Cache package metadata for a couple minutes.
       // The API will use this metadata to update itself often.
-      let resp = ok(aggregated_gzip);
-      resp.headers.set("Content-Encoding", "gzip");
-      return cache_resp(resp, cache, cache_key, "300");
+      return cache_resp(resp, cache, cache_key, "300", gzipped);
     }
 
     const versions_endpoint = new RegExp(
@@ -247,18 +265,8 @@ async function handleRequest(request, env, ctx, sentry) {
       }
 
       // The bot stores a file list over 20 MiB of JSON gzipped, because a KV
-      // value holds at most 25 MiB. Send those bytes as they are with
-      // Content-Encoding: gzip, so HTTP clients inflate them. Reading the
-      // value as text would corrupt it.
-      const bytes = new Uint8Array(version_value);
-      const gzipped = bytes[0] === 0x1f && bytes[1] === 0x8b;
-      const resp = gzipped
-        ? new Response(version_value, {
-            status: 200,
-            headers: { "Content-Encoding": "gzip" },
-            encodeBody: "manual",
-          })
-        : ok(new TextDecoder().decode(bytes));
+      // value holds at most 25 MiB. Reading the value as text would corrupt it.
+      const { resp, gzipped } = kv_bytes_resp(version_value);
 
       // Each version is immutable once in KV
       // so cache it for a year.
