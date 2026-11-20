@@ -44,9 +44,24 @@ async function handleRequest(request, env, ctx, sentry) {
     return respond(msg, 500);
   }
 
-  function cache_resp(resp, cache, cache_key, max_age) {
+  // `manual`: `resp` has encodeBody "manual", so its body is already encoded.
+  function cache_resp(resp, cache, cache_key, max_age, manual = false) {
     resp.headers.append("Cache-Control", `max-age=${max_age}`);
-    ctx.waitUntil(cache.put(cache_key, resp.clone()));
+    // clone() drops encodeBody "manual", and cache.put would then encode the
+    // body a second time, so cache hits sent two gzip layers.
+    const copy = resp.clone();
+    ctx.waitUntil(
+      cache.put(
+        cache_key,
+        manual
+          ? new Response(copy.body, {
+              status: copy.status,
+              headers: copy.headers,
+              encodeBody: "manual",
+            })
+          : copy
+      )
+    );
     // Shadow-compare in background. Runs on cache misses only (this function
     // is only reached when cache.match() returned undefined upstream).
     ctx.waitUntil(shadowCompare(resp.clone(), request, env, sentry));
@@ -236,18 +251,18 @@ async function handleRequest(request, env, ctx, sentry) {
       // Content-Encoding: gzip, so HTTP clients inflate them. Reading the
       // value as text would corrupt it.
       const bytes = new Uint8Array(version_value);
-      const resp =
-        bytes[0] === 0x1f && bytes[1] === 0x8b
-          ? new Response(version_value, {
-              status: 200,
-              headers: { "Content-Encoding": "gzip" },
-              encodeBody: "manual",
-            })
-          : ok(new TextDecoder().decode(bytes));
+      const gzipped = bytes[0] === 0x1f && bytes[1] === 0x8b;
+      const resp = gzipped
+        ? new Response(version_value, {
+            status: 200,
+            headers: { "Content-Encoding": "gzip" },
+            encodeBody: "manual",
+          })
+        : ok(new TextDecoder().decode(bytes));
 
       // Each version is immutable once in KV
       // so cache it for a year.
-      return cache_resp(resp, cache, cache_key, "31536000");
+      return cache_resp(resp, cache, cache_key, "31536000", gzipped);
     }
 
     // Unknown request.
